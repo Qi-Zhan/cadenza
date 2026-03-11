@@ -1,4 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 use anyhow::Context;
 use cpal::{
@@ -9,8 +15,11 @@ use cpal::{
 use crate::{
     analysis::samples_to_buckets,
     app::PlaybackState,
-    audio::{decode_file, prepare_for_output},
+    audio::{AudioDecoder, PreparedAudio, StreamingAudioPreparer, resampled_output_frame_count},
 };
+
+const STARTUP_BUFFER_FRAMES: usize = 48_000;
+const BACKGROUND_DECODE_FRAMES: usize = 24_000;
 
 pub fn extract_analysis_window(samples: &[f32], cursor: usize, window_size: usize) -> Vec<f32> {
     if samples.is_empty() || cursor == 0 {
@@ -42,6 +51,7 @@ pub struct PlaybackProgress {
 pub struct PlayerController {
     stream: Stream,
     shared: Arc<Mutex<PlaybackShared>>,
+    decode_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -52,23 +62,35 @@ struct PlaybackShared {
     sample_rate: u32,
     playback_cursor: usize,
     analysis_cursor: usize,
+    total_playback_frames: Option<usize>,
+    decode_finished: bool,
     playback_state: PlaybackState,
 }
 
 impl PlayerController {
     pub fn from_path(path: &std::path::Path) -> anyhow::Result<Self> {
-        let decoded = decode_file(path)?;
         let host = cpal::default_host();
         let device = host
             .default_output_device()
             .context("no default output device available")?;
         let supported_config = device.default_output_config()?;
         let stream_config: cpal::StreamConfig = supported_config.clone().into();
-        let prepared = prepare_for_output(
-            &decoded,
+        let mut decoder = AudioDecoder::open(path)?;
+        let startup = decoder
+            .decode_frames(STARTUP_BUFFER_FRAMES.max(decoder.sample_rate() as usize))
+            .context("failed to decode startup audio")?
+            .context("no decodable audio frames found for startup")?;
+        let mut preparer = StreamingAudioPreparer::new(
+            startup.channels,
+            startup.sample_rate,
             stream_config.channels,
             stream_config.sample_rate.0,
         );
+        let prepared = preparer.prepare_chunk(&startup);
+        let decode_finished = decoder.is_finished();
+        let total_playback_frames = decoder
+            .total_frames()
+            .map(|frames| resampled_output_frame_count(frames, startup.sample_rate, stream_config.sample_rate.0));
 
         let shared = Arc::new(Mutex::new(PlaybackShared {
             playback_samples: prepared.playback_samples,
@@ -77,6 +99,8 @@ impl PlayerController {
             sample_rate: stream_config.sample_rate.0,
             playback_cursor: 0,
             analysis_cursor: 0,
+            total_playback_frames,
+            decode_finished,
             playback_state: PlaybackState::Playing,
         }));
 
@@ -90,7 +114,22 @@ impl PlayerController {
 
         stream.play()?;
 
-        Ok(Self { stream, shared })
+        let decode_cancel = Arc::new(AtomicBool::new(false));
+
+        if !decode_finished {
+            spawn_decode_thread(
+                decoder,
+                preparer,
+                shared.clone(),
+                decode_cancel.clone(),
+            );
+        }
+
+        Ok(Self {
+            stream,
+            shared,
+            decode_cancel,
+        })
     }
 
     pub fn toggle_pause(&self) -> anyhow::Result<PlaybackState> {
@@ -134,11 +173,12 @@ impl PlayerController {
 }
 
 fn progress_from_shared(shared: &PlaybackShared, sample_rate: u32) -> PlaybackProgress {
-    let total_frames = if shared.output_channels == 0 {
+    let buffered_frames = if shared.output_channels == 0 {
         0
     } else {
         shared.playback_samples.len() / shared.output_channels
     };
+    let total_frames = shared.total_playback_frames.unwrap_or(buffered_frames);
     let position_frames = if shared.output_channels == 0 {
         0
     } else {
@@ -158,6 +198,39 @@ fn progress_from_shared(shared: &PlaybackShared, sample_rate: u32) -> PlaybackPr
     }
 }
 
+fn append_prepared_audio(shared: &mut PlaybackShared, prepared: PreparedAudio) {
+    shared.playback_samples.extend(prepared.playback_samples);
+    shared.analysis_samples.extend(prepared.analysis_samples);
+}
+
+fn spawn_decode_thread(
+    mut decoder: AudioDecoder,
+    mut preparer: StreamingAudioPreparer,
+    shared: Arc<Mutex<PlaybackShared>>,
+    decode_cancel: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        while !decode_cancel.load(Ordering::Relaxed) {
+            match decoder.decode_frames(BACKGROUND_DECODE_FRAMES) {
+                Ok(Some(decoded)) => {
+                    let prepared = preparer.prepare_chunk(&decoded);
+                    let mut shared = shared.lock().unwrap();
+                    append_prepared_audio(&mut shared, prepared);
+                }
+                Ok(None) => {
+                    shared.lock().unwrap().decode_finished = true;
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("audio decode error: {error}");
+                    shared.lock().unwrap().decode_finished = true;
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -173,6 +246,12 @@ where
         err_fn,
         None,
     )?)
+}
+
+impl Drop for PlayerController {
+    fn drop(&mut self) {
+        self.decode_cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 fn write_output_data<T>(output: &mut [T], shared: &Mutex<PlaybackShared>)
@@ -205,7 +284,9 @@ where
             for sample in frame.iter_mut() {
                 *sample = T::from_sample(0.0);
             }
-            shared.playback_state = PlaybackState::Stopped;
+            if shared.decode_finished {
+                shared.playback_state = PlaybackState::Stopped;
+            }
         }
     }
 }
@@ -222,6 +303,8 @@ mod tests {
             sample_rate: 48_000,
             playback_cursor: 0,
             analysis_cursor: 0,
+            total_playback_frames: Some(2),
+            decode_finished: true,
             playback_state: PlaybackState::Playing,
         })
     }
@@ -250,6 +333,8 @@ mod tests {
             sample_rate: 48_000,
             playback_cursor: 0,
             analysis_cursor: 0,
+            total_playback_frames: Some(1),
+            decode_finished: true,
             playback_state: PlaybackState::Playing,
         });
         let mut output = vec![0.0_f32; 4];
@@ -273,6 +358,88 @@ mod tests {
             sample_rate: 48_000,
             playback_cursor: 48_000 * 2,
             analysis_cursor: 0,
+            total_playback_frames: Some(48_000 * 4),
+            decode_finished: true,
+            playback_state: PlaybackState::Playing,
+        };
+
+        let progress = progress_from_shared(&shared, 48_000);
+
+        assert_eq!(progress.position_secs, 1);
+        assert_eq!(progress.total_secs, 4);
+        assert!((progress.ratio - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stays_playing_while_waiting_for_more_decoded_audio() {
+        let shared = Mutex::new(PlaybackShared {
+            playback_samples: vec![0.25, 0.5],
+            analysis_samples: vec![0.1],
+            output_channels: 2,
+            sample_rate: 48_000,
+            playback_cursor: 0,
+            analysis_cursor: 0,
+            total_playback_frames: Some(1),
+            decode_finished: false,
+            playback_state: PlaybackState::Playing,
+        });
+        let mut output = vec![0.0_f32; 4];
+
+        write_output_data(&mut output, &shared);
+
+        assert_eq!(output, vec![0.25, 0.5, 0.0, 0.0]);
+
+        let shared = shared.lock().unwrap().clone();
+        assert_eq!(shared.playback_cursor, 2);
+        assert_eq!(shared.analysis_cursor, 1);
+        assert_eq!(shared.playback_state, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn resumes_writing_samples_after_more_audio_is_appended() {
+        let shared = Mutex::new(PlaybackShared {
+            playback_samples: vec![0.25, 0.5],
+            analysis_samples: vec![0.1],
+            output_channels: 2,
+            sample_rate: 48_000,
+            playback_cursor: 0,
+            analysis_cursor: 0,
+            total_playback_frames: Some(2),
+            decode_finished: false,
+            playback_state: PlaybackState::Playing,
+        });
+        let mut first_output = vec![0.0_f32; 4];
+        write_output_data(&mut first_output, &shared);
+
+        {
+            let mut shared = shared.lock().unwrap();
+            shared.playback_samples.extend([0.75, 1.0]);
+            shared.analysis_samples.push(0.2);
+        }
+
+        let mut second_output = vec![0.0_f32; 2];
+        write_output_data(&mut second_output, &shared);
+
+        assert_eq!(first_output, vec![0.25, 0.5, 0.0, 0.0]);
+        assert_eq!(second_output, vec![0.75, 1.0]);
+
+        let shared = shared.lock().unwrap().clone();
+        assert_eq!(shared.playback_cursor, 4);
+        assert_eq!(shared.analysis_cursor, 2);
+        assert_eq!(shared.playback_state, PlaybackState::Playing);
+    }
+
+    #[test]
+    fn reports_progress_against_known_track_length_while_buffer_grows() {
+        let shared = PlaybackShared {
+            playback_samples: vec![0.0; 48_000 * 2 * 2],
+            analysis_samples: vec![],
+            output_channels: 2,
+            sample_rate: 48_000,
+            playback_cursor: 48_000 * 2,
+            analysis_cursor: 0,
+            total_playback_frames: Some(48_000 * 4),
+            decode_finished: false,
             playback_state: PlaybackState::Playing,
         };
 

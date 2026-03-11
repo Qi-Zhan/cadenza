@@ -134,6 +134,12 @@ impl VisualizerFrameState {
             self.surface_velocities[index] = velocity;
             self.smoothed[index] = surface;
 
+            if surface <= f32::EPSILON && target <= f32::EPSILON {
+                self.surface_velocities[index] = 0.0;
+                self.peaks[index] = 0.0;
+                self.orb_positions[index] = 0.0;
+                continue;
+            }
             let lifted_peak = (surface + PEAK_LIFT + (target - surface).max(0.0) * 0.18).min(1.0);
             let peak = if surface >= self.peaks[index] {
                 lifted_peak.max(surface)
@@ -176,13 +182,20 @@ fn smoothed_target(raw: &[f32], index: usize) -> f32 {
         return 0.0;
     }
 
-    let left = raw.get(index.saturating_sub(1)).copied().unwrap_or(raw[index]);
-    let center = raw[index];
-    let right = raw.get(index + 1).copied().unwrap_or(raw[index]);
+    let mut weighted_sum = raw[index] * TARGET_CENTER_WEIGHT;
+    let mut total_weight = TARGET_CENTER_WEIGHT;
 
-    (left * TARGET_NEIGHBOR_WEIGHT
-        + center * TARGET_CENTER_WEIGHT
-        + right * TARGET_NEIGHBOR_WEIGHT)
+    if let Some(left) = index.checked_sub(1).and_then(|left| raw.get(left)) {
+        weighted_sum += *left * TARGET_NEIGHBOR_WEIGHT;
+        total_weight += TARGET_NEIGHBOR_WEIGHT;
+    }
+
+    if let Some(right) = raw.get(index + 1) {
+        weighted_sum += *right * TARGET_NEIGHBOR_WEIGHT;
+        total_weight += TARGET_NEIGHBOR_WEIGHT;
+    }
+
+    (weighted_sum / total_weight.max(f32::EPSILON))
         .clamp(0.0, 1.0)
 }
 
@@ -771,5 +784,16 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smoothed_target;
+
+    #[test]
+    fn normalizes_edge_target_weights() {
+        assert!((smoothed_target(&[1.0, 0.0], 0) - 0.75).abs() < f32::EPSILON);
+        assert!((smoothed_target(&[1.0, 0.0], 1) - 0.25).abs() < f32::EPSILON);
     }
 }

@@ -20,6 +20,10 @@ fn entry(name: &str, kind: BrowserEntryKind) -> BrowserEntry {
     }
 }
 
+fn is_signal_glyph(glyph: char) -> bool {
+    matches!(glyph, '│' | '●' | '•' | '·')
+}
+
 #[test]
 fn marks_the_selected_browser_entry() {
     let entries = vec![
@@ -137,6 +141,44 @@ fn keeps_the_top_accent_close_to_the_surface_after_a_strong_hit() {
 }
 
 #[test]
+fn shares_edge_energy_more_evenly_with_the_only_neighbor() {
+    let mut frame_state = VisualizerFrameState::new(2);
+    frame_state.advance(&[1.0, 0.0]);
+
+    assert!(frame_state.smoothed()[1] > 0.0);
+    assert!(frame_state.smoothed()[1] * 3.0 >= frame_state.smoothed()[0]);
+}
+
+#[test]
+fn keeps_new_slots_idle_when_resizing_to_more_buckets() {
+    let mut frame_state = VisualizerFrameState::new(1);
+    frame_state.advance(&[1.0]);
+
+    frame_state.advance(&[0.0, 0.0, 0.0]);
+
+    assert_eq!(frame_state.smoothed().len(), 3);
+    assert_eq!(frame_state.peaks()[1], 0.0);
+    assert_eq!(frame_state.peaks()[2], 0.0);
+    assert_eq!(frame_state.orb_positions()[1], 0.0);
+    assert_eq!(frame_state.orb_positions()[2], 0.0);
+}
+
+#[test]
+fn keeps_new_slots_idle_after_shrinking_then_growing_again() {
+    let mut frame_state = VisualizerFrameState::new(3);
+    frame_state.advance(&[1.0, 0.0, 0.0]);
+    frame_state.advance(&[0.0, 1.0]);
+
+    frame_state.advance(&[0.0, 0.0, 0.0, 0.0]);
+
+    assert_eq!(frame_state.smoothed().len(), 4);
+    assert_eq!(frame_state.peaks()[2], 0.0);
+    assert_eq!(frame_state.peaks()[3], 0.0);
+    assert_eq!(frame_state.orb_positions()[2], 0.0);
+    assert_eq!(frame_state.orb_positions()[3], 0.0);
+}
+
+#[test]
 fn orb_heads_fall_back_without_sinking_below_the_line() {
     let mut frame_state = VisualizerFrameState::new(1);
     frame_state.advance(&[1.0]);
@@ -156,6 +198,39 @@ fn graph_body_uses_needle_lines() {
     let panel = visualizer_panel_text(40, 10, &frame_state);
 
     assert!(panel.contains('│'));
+}
+
+#[test]
+fn graph_body_renders_an_isolated_spike_as_a_wider_surface() {
+    let mut frame_state = VisualizerFrameState::new(5);
+    frame_state.advance(&[0.0, 0.0, 1.0, 0.0, 0.0]);
+    let panel = visualizer_panel_text(5, 6, &frame_state);
+    let rows = panel
+        .lines()
+        .map(|line| line.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let second_from_bottom = &rows[rows.len().saturating_sub(2)];
+
+    assert!(is_signal_glyph(second_from_bottom[1]));
+    assert!(is_signal_glyph(second_from_bottom[2]));
+    assert!(is_signal_glyph(second_from_bottom[3]));
+}
+
+#[test]
+fn graph_body_keeps_new_silent_slots_empty_after_resize() {
+    let mut frame_state = VisualizerFrameState::new(1);
+    frame_state.advance(&[1.0]);
+    frame_state.advance(&[0.0, 0.0, 0.0]);
+    let panel = visualizer_panel_text(3, 6, &frame_state);
+    let rows = panel
+        .lines()
+        .map(|line| line.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    for row in 0..rows.len().saturating_sub(1) {
+        assert_eq!(rows[row][1], ' ');
+        assert_eq!(rows[row][2], ' ');
+    }
 }
 
 #[test]
