@@ -118,12 +118,22 @@ fn tempers_the_first_rise_of_a_strong_hit() {
 }
 
 #[test]
-fn orb_heads_overshoot_the_line_after_a_strong_hit() {
+fn spreads_an_isolated_spike_into_neighboring_buckets() {
+    let mut frame_state = VisualizerFrameState::new(5);
+    frame_state.advance(&[0.0, 0.0, 1.0, 0.0, 0.0]);
+
+    assert!(frame_state.smoothed()[1] > 0.0);
+    assert!(frame_state.smoothed()[3] > 0.0);
+    assert!(frame_state.smoothed()[2] > frame_state.smoothed()[1]);
+}
+
+#[test]
+fn keeps_the_top_accent_close_to_the_surface_after_a_strong_hit() {
     let mut frame_state = VisualizerFrameState::new(1);
-    frame_state.advance(&[1.0]);
     frame_state.advance(&[1.0]);
 
     assert!(frame_state.orb_positions()[0] > frame_state.smoothed()[0]);
+    assert!(frame_state.orb_positions()[0] - frame_state.smoothed()[0] < 0.16);
 }
 
 #[test]

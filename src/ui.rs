@@ -30,9 +30,17 @@ const NEEDLE_GLYPH: char = '│';
 const HEAD_GLYPH: char = '●';
 const PEAK_GLYPH: char = '•';
 const GLOW_GLYPH: char = '·';
-const ORB_LIFT: f32 = 0.06;
-const ORB_GRAVITY: f32 = 0.045;
-const ORB_MAX_VELOCITY: f32 = 0.22;
+const TARGET_CENTER_WEIGHT: f32 = 0.6;
+const TARGET_NEIGHBOR_WEIGHT: f32 = 0.2;
+const SURFACE_ATTACK: f32 = 0.34;
+const SURFACE_RELEASE: f32 = 0.16;
+const SURFACE_DAMPING: f32 = 0.72;
+const SURFACE_REVERSAL_DAMPING: f32 = 0.05;
+const PEAK_LIFT: f32 = 0.09;
+const PEAK_FALL_RATE: f32 = 0.028;
+const ORB_BASE_OFFSET: f32 = 0.018;
+const ORB_PEAK_INFLUENCE: f32 = 0.35;
+const ORB_MAX_OFFSET: f32 = 0.14;
 pub fn render_browser_labels(
     entries: &[BrowserEntry],
     state: &AppState,
@@ -71,18 +79,18 @@ pub fn render_browser_labels(
 #[derive(Debug, Clone)]
 pub struct VisualizerFrameState {
     smoothed: Vec<f32>,
+    surface_velocities: Vec<f32>,
     peaks: Vec<f32>,
     orb_positions: Vec<f32>,
-    orb_velocities: Vec<f32>,
 }
 
 impl VisualizerFrameState {
     pub fn new(bucket_count: usize) -> Self {
         Self {
             smoothed: vec![0.0; bucket_count],
+            surface_velocities: vec![0.0; bucket_count],
             peaks: vec![0.0; bucket_count],
             orb_positions: vec![0.0; bucket_count],
-            orb_velocities: vec![0.0; bucket_count],
         }
     }
 
@@ -94,56 +102,60 @@ impl VisualizerFrameState {
 
         if self.smoothed.len() != raw.len() {
             self.smoothed.resize(raw.len(), 0.0);
+            self.surface_velocities.resize(raw.len(), 0.0);
             self.peaks.resize(raw.len(), 0.0);
             self.orb_positions.resize(raw.len(), 0.0);
-            self.orb_velocities.resize(raw.len(), 0.0);
         }
 
-        for (index, value) in raw.iter().copied().enumerate() {
+        let targets = raw
+            .iter()
+            .enumerate()
+            .map(|(index, _)| smoothed_target(raw, index))
+            .collect::<Vec<_>>();
+
+        for (index, target) in targets.into_iter().enumerate() {
             let previous = self.smoothed[index];
-            let smoothed = if value >= previous {
-                previous * 0.55 + value * 0.45
+            let response = if target >= previous {
+                SURFACE_ATTACK
             } else {
-                previous * 0.9 + value * 0.1
+                SURFACE_RELEASE
             };
-
-            self.smoothed[index] = smoothed.clamp(0.0, 1.0);
-
-            let next_peak = if value >= self.peaks[index] {
-                value
+            let previous_velocity = self.surface_velocities[index];
+            let carried_velocity = if (target - previous).signum() != previous_velocity.signum()
+                && previous_velocity != 0.0
+            {
+                previous_velocity * SURFACE_REVERSAL_DAMPING
             } else {
-                (self.peaks[index] - 0.04).max(self.smoothed[index])
+                previous_velocity * SURFACE_DAMPING
             };
-            self.peaks[index] = next_peak.clamp(0.0, 1.0);
+            let velocity = carried_velocity + (target - previous) * response;
+            let surface = (previous + velocity).clamp(0.0, 1.0);
 
-            let target = self.smoothed[index];
-            let orb_position = self.orb_positions[index];
+            self.surface_velocities[index] = velocity;
+            self.smoothed[index] = surface;
 
-            if target > orb_position {
-                let impulse = ((target - orb_position) * 0.55 + ORB_LIFT).min(ORB_MAX_VELOCITY);
-                self.orb_positions[index] = (target + impulse).clamp(0.0, 1.0);
-                self.orb_velocities[index] = impulse;
+            let lifted_peak = (surface + PEAK_LIFT + (target - surface).max(0.0) * 0.18).min(1.0);
+            let peak = if surface >= self.peaks[index] {
+                lifted_peak.max(surface)
             } else {
-                let next_velocity =
-                    (self.orb_velocities[index] * 0.2 - ORB_GRAVITY).max(-ORB_MAX_VELOCITY);
-                let next_position = self.orb_positions[index] + next_velocity;
+                (self.peaks[index] - PEAK_FALL_RATE).max(surface)
+            };
+            self.peaks[index] = peak.clamp(0.0, 1.0);
 
-                if next_position <= target {
-                    self.orb_positions[index] = target;
-                    self.orb_velocities[index] = 0.0;
-                } else {
-                    self.orb_positions[index] = next_position.clamp(0.0, 1.0);
-                    self.orb_velocities[index] = next_velocity;
-                }
-            }
+            let desired_orb = (surface
+                + ORB_BASE_OFFSET
+                + (self.peaks[index] - surface).max(0.0) * ORB_PEAK_INFLUENCE)
+                .min(surface + ORB_MAX_OFFSET)
+                .min(1.0);
+            self.orb_positions[index] = desired_orb.max(surface);
         }
     }
 
     pub fn clear(&mut self) {
         self.smoothed.fill(0.0);
+        self.surface_velocities.fill(0.0);
         self.peaks.fill(0.0);
         self.orb_positions.fill(0.0);
-        self.orb_velocities.fill(0.0);
     }
 
     pub fn smoothed(&self) -> &[f32] {
@@ -157,6 +169,21 @@ impl VisualizerFrameState {
     pub fn orb_positions(&self) -> &[f32] {
         &self.orb_positions
     }
+}
+
+fn smoothed_target(raw: &[f32], index: usize) -> f32 {
+    if raw.is_empty() {
+        return 0.0;
+    }
+
+    let left = raw.get(index.saturating_sub(1)).copied().unwrap_or(raw[index]);
+    let center = raw[index];
+    let right = raw.get(index + 1).copied().unwrap_or(raw[index]);
+
+    (left * TARGET_NEIGHBOR_WEIGHT
+        + center * TARGET_CENTER_WEIGHT
+        + right * TARGET_NEIGHBOR_WEIGHT)
+        .clamp(0.0, 1.0)
 }
 
 pub fn status_line(entry_count: usize, _state: &AppState) -> String {
