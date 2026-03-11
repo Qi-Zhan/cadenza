@@ -1,0 +1,9 @@
+pub mod app;
+pub mod analysis;
+pub mod audio;
+pub mod catalog;
+pub mod cli;
+pub mod download;
+pub mod library;
+pub mod player;
+pub mod ui;
