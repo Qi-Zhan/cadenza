@@ -1,6 +1,6 @@
 [package]
 name = "cadenza"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A terminal-first classical music player and visualizer built in Rust."
 license = "MIT"
