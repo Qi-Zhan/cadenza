@@ -64,14 +64,15 @@ pub fn render_browser_labels(
         .skip(start)
         .take(visible)
         .map(|(index, entry)| {
-            let prefix = if index == selected { "> " } else { "  " };
+            let prefix = if index == selected { "›" } else { " " };
+            let name = display_browser_entry_name(entry);
             let icon = match entry.kind {
                 BrowserEntryKind::Directory if entry.expanded => "▾",
                 BrowserEntryKind::Directory => "▸",
                 BrowserEntryKind::AudioFile => "♪",
             };
-            let indent = "  ".repeat(entry.depth);
-            format!("{prefix}{indent}{icon} {}", entry.name)
+            let indent = " ".repeat(entry.depth);
+            format!("{prefix}{indent}{icon} {name}")
         })
         .collect()
 }
@@ -239,14 +240,16 @@ pub fn run_ui(state: &mut AppState) -> anyhow::Result<()> {
                 KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
                     if state.move_left() {
                         if let Some(entry) = state.selected_entry() {
-                            status_message = format!("browse {}", entry.name);
+                            status_message =
+                                format!("browse {}", display_browser_entry_name(entry));
                         }
                     }
                 }
                 KeyCode::Char('l') | KeyCode::Right => {
                     if state.move_right() {
                         if let Some(entry) = state.selected_entry() {
-                            status_message = format!("browse {}", entry.name);
+                            status_message =
+                                format!("browse {}", display_browser_entry_name(entry));
                         }
                     }
                 }
@@ -254,7 +257,8 @@ pub fn run_ui(state: &mut AppState) -> anyhow::Result<()> {
                     BrowserAction::None => {}
                     BrowserAction::ToggledDirectory => {
                         if let Some(entry) = state.selected_entry() {
-                            status_message = format!("browse {}", entry.name);
+                            status_message =
+                                format!("browse {}", display_browser_entry_name(entry));
                         }
                     }
                     BrowserAction::PlayFile(path) => match PlayerController::from_path(&path) {
@@ -328,9 +332,13 @@ fn draw_ui(
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
+    let (left_width, right_width) = split_panel_widths(layout[0].width);
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(38), Constraint::Min(48)])
+        .constraints([
+            Constraint::Length(left_width),
+            Constraint::Length(right_width),
+        ])
         .split(layout[0]);
 
     let left_sections = Layout::default()
@@ -439,6 +447,23 @@ fn draw_ui(
     frame.render_widget(spectrum_header, spectrum_sections[0]);
     frame.render_widget(spectrum, spectrum_sections[1]);
     frame.render_widget(footer, layout[1]);
+}
+
+fn split_panel_widths(total_width: u16) -> (u16, u16) {
+    if total_width <= 1 {
+        return (total_width, total_width.saturating_sub(total_width));
+    }
+
+    let min_left = 12;
+    let min_right = 24;
+    if total_width < min_left + min_right {
+        let left = (total_width / 2).max(1);
+        return (left, total_width.saturating_sub(left));
+    }
+
+    let preferred_left = (total_width.saturating_mul(2) / 5).clamp(16, 38);
+    let left = preferred_left.max(min_left).min(total_width - min_right);
+    (left, total_width - left)
 }
 
 fn footer_text(
@@ -740,11 +765,18 @@ fn current_now_label(state: &AppState, playback: &PlaybackState) -> Option<Strin
             .map(display_name_from_path);
     }
 
-    state.selected_entry().map(|entry| entry.name.clone())
+    state.selected_entry().map(display_browser_entry_name)
+}
+
+fn display_browser_entry_name(entry: &BrowserEntry) -> String {
+    match entry.kind {
+        BrowserEntryKind::Directory => entry.name.clone(),
+        BrowserEntryKind::AudioFile => display_name_from_path(Path::new(&entry.name)),
+    }
 }
 
 fn display_name_from_path(path: &Path) -> String {
-    path.file_name()
+    path.file_stem()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
@@ -789,11 +821,77 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::smoothed_target;
+    use std::{fs, path::Path};
+
+    use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::tempdir;
+
+    use super::{
+        VisualizerFrameState, current_now_label, display_name_from_path, draw_ui,
+        smoothed_target,
+    };
+    use crate::app::{AppState, PlaybackState};
 
     #[test]
     fn normalizes_edge_target_weights() {
         assert!((smoothed_target(&[1.0, 0.0], 0) - 0.75).abs() < f32::EPSILON);
         assert!((smoothed_target(&[1.0, 0.0], 1) - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn strips_extensions_from_paths_for_display() {
+        assert_eq!(display_name_from_path(Path::new("music/Prelude.ogg")), "Prelude");
+        assert_eq!(display_name_from_path(Path::new("music/Bach")), "Bach");
+    }
+
+    #[test]
+    fn omits_audio_extensions_from_idle_now_labels() {
+        let library = tempdir().unwrap();
+        fs::write(library.path().join("Prelude.ogg"), b"").unwrap();
+        let state = AppState::new(library.path()).unwrap();
+
+        assert_eq!(
+            current_now_label(&state, &PlaybackState::Stopped).as_deref(),
+            Some("Prelude")
+        );
+    }
+
+    fn render_test_ui(width: u16, height: u16, playback: PlaybackState) -> String {
+        let library = tempdir().unwrap();
+        fs::write(library.path().join("Prelude.ogg"), b"").unwrap();
+        let state = AppState::new(library.path()).unwrap();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let visualizer = VisualizerFrameState::new(8);
+
+        terminal
+            .draw(|frame| {
+                draw_ui(frame, &state, &playback, None, &visualizer, "");
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn keeps_a_track_visible_in_short_viewports() {
+        let rendered = render_test_ui(80, 10, PlaybackState::Playing);
+
+        assert!(rendered.contains("♫ Catalog"), "{rendered}");
+        assert!(rendered.contains("Prelude"), "{rendered}");
+    }
+
+    #[test]
+    fn keeps_a_track_visible_in_narrow_viewports() {
+        let rendered = render_test_ui(48, 16, PlaybackState::Playing);
+
+        assert!(rendered.contains("♫ Catalog"), "{rendered}");
+        assert!(rendered.contains("Prelude"), "{rendered}");
     }
 }

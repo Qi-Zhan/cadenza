@@ -36,8 +36,8 @@ fn marks_the_selected_browser_entry() {
     let labels = render_browser_labels(&entries, &state, 4);
 
     assert_eq!(labels.len(), 2);
-    assert!(labels[0].starts_with("  "));
-    assert!(labels[1].starts_with("> "));
+    assert!(labels[0].starts_with(" "));
+    assert!(labels[1].starts_with("›"));
 }
 
 #[test]
@@ -77,9 +77,10 @@ fn browser_labels_render_tree_indentation() {
 
     let labels = render_browser_labels(&entries, &state, 8);
 
-    assert!(labels[0].contains("▾ 巴赫"));
+    assert!(labels[0].contains("›▾ 巴赫"));
     assert!(labels[1].contains("  ▸ 管风琴"));
-    assert!(labels[2].contains("    ♪ 赋格.ogg"));
+    assert!(labels[2].contains("   ♪ 赋格"));
+    assert!(!labels[2].contains(".ogg"));
 }
 
 #[test]
