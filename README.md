@@ -9,6 +9,10 @@ It focuses on:
 - live spectrum rendering
 - classical music-friendly presentation
 
+## Preview
+
+![Cadenza demo](assets/screen.gif)
+
 ## Install
 
 Install the player from the repository root:
@@ -47,4 +51,3 @@ cadenza ~/Music/cadenza
 - `flac`
 - `wav`
 - `ogg`
-
